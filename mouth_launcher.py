@@ -1,21 +1,18 @@
 """Mouth-gesture app launcher: shape your mouth into an "O" to open
-Excel; make the same "O" again once Excel is open to bring up Windows'
-Task View (Win+Tab) instead of opening a second Excel window.
+Excel; make the same "O" again to bring up Windows' Task View
+(Win+Tab) if Excel is already running, or relaunch it if you closed it
+manually -- checked live via `tasklist`, not a stale internal flag.
 
 Uses MediaPipe's FaceLandmarker with blendshapes -- the face equivalent
-of hand_tracker.py's HandLandmarker. The "O" shape is read off the
-`mouthFunnel` blendshape (lips rounded and parted, the exact shape of
-pronouncing "oh") the same way is_fist() reads finger-curl geometry:
-a threshold, held briefly via HoldTimer, re-armed once the mouth
-relaxes.
+of hand_tracker.py's HandLandmarker. The "O" shape requires both a
+rounded mouth (mouthFunnel/mouthPucker) AND an open jaw (jawOpen) --
+roundness alone fired too easily on an ordinary resting/talking face.
+See mouth_gesture.py for the exact thresholds.
 
-This is a small standalone test of face-blendshape gestures, kept
-separate from screenshot_gallery.py -- merge later if it proves out.
-
-Known simplification: Excel's "open" state is tracked with a plain
-flag, not by checking whether the process is still running -- closing
-Excel by hand won't be noticed, and the next "O" will trigger Task
-View instead of relaunching it.
+This is a standalone test of face-blendshape gestures. The same
+mouth_gesture.py helpers are also wired into screenshot_gallery.py's
+main app -- this script exists to try the gesture in isolation, with a
+live diagnostic readout, without the rest of the app's UI in the way.
 
 Controls:
   q   quit
@@ -24,11 +21,18 @@ import ctypes
 import os
 
 import cv2
-import win32api
-import win32con
 
 from face_tracker import FaceTracker
 from hold_timer import HoldTimer
+from mouth_gesture import (
+    MOUTH_O_HOLD_SECONDS,
+    MOUTH_O_JAW_THRESHOLD,
+    MOUTH_O_ROUNDNESS_THRESHOLD,
+    is_mouth_o,
+    is_process_running,
+    mouth_roundness,
+    open_task_view,
+)
 from overlay_window import pin_to_corner
 
 ctypes.windll.user32.SetProcessDPIAware()
@@ -36,16 +40,7 @@ ctypes.windll.user32.SetProcessDPIAware()
 WINDOW_TITLE = "Mouth Launcher"
 WINDOW_W, WINDOW_H = 360, 280
 
-MOUTH_O_THRESHOLD = 0.5
-MOUTH_O_HOLD_SECONDS = 0.4
-
-
-def open_task_view() -> None:
-    """Simulates the Win+Tab shortcut via synthetic key events."""
-    win32api.keybd_event(win32con.VK_LWIN, 0, 0, 0)
-    win32api.keybd_event(win32con.VK_TAB, 0, 0, 0)
-    win32api.keybd_event(win32con.VK_TAB, 0, win32con.KEYEVENTF_KEYUP, 0)
-    win32api.keybd_event(win32con.VK_LWIN, 0, win32con.KEYEVENTF_KEYUP, 0)
+EXCEL_IMAGE_NAME = "EXCEL.EXE"
 
 
 def main():
@@ -58,35 +53,49 @@ def main():
 
     mouth_timer = HoldTimer()
     mouth_armed = True
-    excel_launched = False
     hwnd = None
 
     try:
         while True:
-            ok, frame = cap.read()
+            ok, raw_frame = cap.read()
             if not ok:
                 break
-            frame = cv2.flip(frame, 1)
-            frame = cv2.resize(frame, (WINDOW_W, WINDOW_H))
+            raw_frame = cv2.flip(raw_frame, 1)
 
-            blendshapes = tracker.process(frame)
-            funnel = blendshapes.get("mouthFunnel", 0.0) if blendshapes else 0.0
-            is_o = funnel > MOUTH_O_THRESHOLD
+            # Track at native webcam resolution for accuracy -- MediaPipe's
+            # face detector is noticeably less reliable on a pre-shrunk
+            # 360x280 image, only resize for display below.
+            blendshapes = tracker.process(raw_frame)
+            frame = cv2.resize(raw_frame, (WINDOW_W, WINDOW_H))
+
+            face_found = blendshapes is not None
+            is_o = is_mouth_o(blendshapes)
 
             held = mouth_timer.update(is_o)
             if not is_o:
                 mouth_armed = True
             if mouth_armed and held >= MOUTH_O_HOLD_SECONDS:
-                if not excel_launched:
-                    os.startfile("excel")
-                    excel_launched = True
-                else:
+                if is_process_running(EXCEL_IMAGE_NAME):
                     open_task_view()
+                else:
+                    os.startfile("excel")
                 mouth_armed = False
 
-            status = ("Excel ouvert -- 'O' suivant = Vue des taches"
-                      if excel_launched else "Faites un 'O' pour ouvrir Excel")
-            cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, "'O' : ouvre Excel, ou Vue des taches s'il tourne deja",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+            # Live diagnostic readout -- lets you see whether a face is even
+            # being found and what score your "O" actually reaches, instead
+            # of guessing why nothing triggers.
+            face_status = f"visage: {'detecte' if face_found else 'NON DETECTE'}"
+            cv2.putText(frame, face_status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 255, 0) if face_found else (0, 0, 255), 1)
+            roundness = mouth_roundness(blendshapes)
+            jaw_open = blendshapes.get("jawOpen", 0.0) if blendshapes else 0.0
+            cv2.putText(frame, f"rondeur {roundness:.2f} (seuil {MOUTH_O_ROUNDNESS_THRESHOLD})"
+                                f"  jaw {jaw_open:.2f} (seuil {MOUTH_O_JAW_THRESHOLD})",
+                        (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+
             pct = 1.0 if not mouth_armed else min(held / MOUTH_O_HOLD_SECONDS, 1.0)
             bar_color = (0, 255, 0) if is_o else (100, 100, 100)
             cv2.rectangle(frame, (10, WINDOW_H - 20), (10 + int(100 * pct), WINDOW_H - 12), bar_color, -1)

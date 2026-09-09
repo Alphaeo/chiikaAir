@@ -32,11 +32,18 @@ Either kind (selected photo or selected block):
     (via Python's exec -- no sandboxing, it's your own code on your
     own machine); the output is shown below it.
 
+Mouth (experimental, corner view only):
+  - Shape your mouth into an "O" and hold ~0.4s -> opens Excel. Do it
+    again once Excel is open -> brings up Windows' Task View instead
+    of relaunching it. See mouth_gesture.py / mouth_launcher.py for
+    the standalone version with a live diagnostic readout.
+
 Controls:
   q   quit (disabled while typing into a block -- pinch/Escape out first)
   c   clear the gallery and all blocks
 """
 import ctypes
+import os
 import time
 from collections import deque
 
@@ -47,8 +54,10 @@ import numpy as np
 from blocks import BUTTON_TEXT_RECT, BUTTON_CODE_RECT, BlockManager
 from circle_gesture import CircleDetector
 from code_runner import run_code
+from face_tracker import FaceTracker
 from hand_tracker import HandTracker, THUMB_TIP, INDEX_TIP
 from hold_timer import HoldTimer
+from mouth_gesture import MOUTH_O_HOLD_SECONDS, is_mouth_o, is_process_running, mouth_roundness, open_task_view
 from overlay_window import pin_to_corner, move_resize, corner_position, screen_size
 
 # Windows scales screenshots to match display scaling (125%, 150%...)
@@ -124,6 +133,7 @@ def main():
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
 
     tracker = HandTracker(num_hands=1)
+    face_tracker = FaceTracker()
     sct = mss.MSS()
     monitor = sct.monitors[1]
 
@@ -147,6 +157,8 @@ def main():
     block_hover_candidate = None
     spread_timer = HoldTimer()
     pinch_timer = HoldTimer()
+    mouth_timer = HoldTimer()
+    mouth_armed = True
     arrow_hover_timer = HoldTimer()
     run_timer = HoldTimer()
     run_armed = True
@@ -210,6 +222,21 @@ def main():
 
                 if selected_index is not None and selected_index >= len(gallery):
                     selected_index = None  # gallery shrank/cleared under us
+
+                # --- mouth gesture: "O" (rounded + open jaw) held, re-armed on relaxed mouth ---
+                blendshapes = face_tracker.process(raw_frame)
+                mouth_face_found = blendshapes is not None
+                mouth_roundness_now = mouth_roundness(blendshapes)
+                mouth_is_o = is_mouth_o(blendshapes)
+                mouth_held = mouth_timer.update(mouth_is_o)
+                if not mouth_is_o:
+                    mouth_armed = True
+                if mouth_armed and mouth_held >= MOUTH_O_HOLD_SECONDS:
+                    if is_process_running("EXCEL.EXE"):
+                        open_task_view()
+                    else:
+                        os.startfile("excel")
+                    mouth_armed = False
 
                 frame = cv2.resize(raw_frame, (CORNER_W, CORNER_H))
                 scale_x, scale_y = CORNER_W / native_w, CORNER_H / native_h
@@ -323,6 +350,16 @@ def main():
                     pct = min(fist_held / FIST_HOLD_SECONDS, 1.0)
                     cv2.rectangle(frame, (10, CORNER_H - 20), (10 + int(100 * pct), CORNER_H - 12), (0, 255, 0), -1)
 
+                # --- mouth diagnostic: face-found status + live "O" score, bottom-right ---
+                mouth_label = f"bouche: {mouth_roundness_now:.2f}" if mouth_face_found else "bouche: visage non detecte"
+                cv2.putText(frame, mouth_label, (CORNER_W - 210, CORNER_H - 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                            (0, 255, 0) if mouth_face_found else (0, 0, 255), 1)
+                mouth_pct = 1.0 if not mouth_armed else min(mouth_held / MOUTH_O_HOLD_SECONDS, 1.0)
+                mouth_bar_color = (0, 255, 0) if mouth_is_o else (100, 100, 100)
+                cv2.rectangle(frame, (CORNER_W - 110, CORNER_H - 20), (CORNER_W - 110 + int(100 * mouth_pct), CORNER_H - 12),
+                              mouth_bar_color, -1)
+
             elif fullscreen_kind == "photo":
                 screen_w, screen_h = screen_size()
                 frame = cv2.resize(gallery[selected_index]["full"], (screen_w, screen_h))
@@ -366,9 +403,9 @@ def main():
                         index_pt_full = None
 
                     # --- code blocks: closed fist, held, runs the typed code ---
+                    is_fist = hand is not None and hand.is_fist()
                     run_progress = 0.0
                     if block["kind"] == "code":
-                        is_fist = hand is not None and hand.is_fist()
                         run_held = run_timer.update(is_fist)
                         if not is_fist:
                             run_armed = True
@@ -409,7 +446,10 @@ def main():
                     cv2.putText(frame, hint, (px, py - 12),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
-                    is_pinching = pinch_dist is not None and pinch_dist < PINCH_THRESHOLD_PX
+                    # A closed fist naturally brings thumb+index close together too,
+                    # so without `not is_fist` here, running code (fist) would also
+                    # register as the pinch-to-return gesture and immediately exit.
+                    is_pinching = pinch_dist is not None and pinch_dist < PINCH_THRESHOLD_PX and not is_fist
                     if pinch_timer.update(is_pinching) >= PINCH_HOLD_SECONDS and hwnd is not None:
                         return_to_corner()
 
@@ -443,6 +483,7 @@ def main():
                         return_to_corner()
     finally:
         tracker.close()
+        face_tracker.close()
         cap.release()
         cv2.destroyAllWindows()
 

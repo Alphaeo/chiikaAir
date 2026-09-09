@@ -22,7 +22,7 @@ MODEL_PATH = "models/face_landmarker.task"
 
 
 class FaceTracker:
-    def __init__(self, min_detection_confidence: float = 0.5):
+    def __init__(self, min_detection_confidence: float = 0.35):
         options = FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
             running_mode=RunningMode.VIDEO,
