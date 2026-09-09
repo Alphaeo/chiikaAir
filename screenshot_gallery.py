@@ -16,12 +16,12 @@ Blocks:
     trash button (bottom-right) and hold briefly to delete it.
   - Point at a block to select it.
   - Draw a circle in the air with your index finger while it's over a
-    block (the block's border turns magenta while a link is pending),
-    then point at a second block -> links the two. Linked blocks are
-    always shown connected by an arrow in the corner view. While a
-    linked block is zoomed (see below), the same arrow appears on its
-    right edge -- hover it to jump straight to the linked block (and
-    so on, if that one is linked too).
+    block (the block's border turns accent-colored while a link is
+    pending), then point at a second block -> links the two. Linked
+    blocks are always shown connected by an arrow in the corner view.
+    While a linked block is zoomed (see below), the same arrow appears
+    on its right edge -- hover it to jump straight to the linked block
+    (and so on, if that one is linked too).
 
 Either kind (selected photo or selected block):
   - Spread your thumb and index apart -> it takes over the whole
@@ -38,6 +38,12 @@ Mouth (experimental, corner view only):
     of relaunching it. See mouth_gesture.py / mouth_launcher.py for
     the standalone version with a live diagnostic readout.
 
+Gesture thresholds (pinch/spread) are expressed as ratios of the
+hand's own size (hand_tracker.Hand.scale()), not raw pixels -- so they
+hold up whether your hand is close to or far from the webcam. Fingertip
+positions used to drive hovering/dragging are lightly smoothed
+(smoothing.PointSmoother) to cut down on frame-to-frame jitter.
+
 Controls:
   q   quit (disabled while typing into a block -- pinch/Escape out first)
   c   clear the gallery and all blocks
@@ -51,6 +57,7 @@ import cv2
 import mss
 import numpy as np
 
+import theme
 from blocks import BUTTON_TEXT_RECT, BUTTON_CODE_RECT, BlockManager
 from circle_gesture import CircleDetector
 from code_runner import run_code
@@ -59,6 +66,7 @@ from hand_tracker import HandTracker, THUMB_TIP, INDEX_TIP
 from hold_timer import HoldTimer
 from mouth_gesture import MOUTH_O_HOLD_SECONDS, is_mouth_o, is_process_running, mouth_roundness, open_task_view
 from overlay_window import pin_to_corner, move_resize, corner_position, screen_size
+from smoothing import PointSmoother
 
 # Windows scales screenshots to match display scaling (125%, 150%...)
 # unless the process declares itself DPI-aware -- without this call
@@ -67,6 +75,7 @@ ctypes.windll.user32.SetProcessDPIAware()
 
 WINDOW_TITLE = "Webcam Overlay"
 CORNER_W, CORNER_H = 420, 320
+CORNER_RADIUS = 18
 
 THUMB_W, THUMB_H = 96, 64
 THUMB_MARGIN = 8
@@ -76,9 +85,18 @@ FIST_HOLD_SECONDS = 0.4
 HOVER_HOLD_SECONDS = 0.15
 SPREAD_HOLD_SECONDS = 0.3
 PINCH_HOLD_SECONDS = 0.3
-SPREAD_THRESHOLD_PX = 150
-PINCH_THRESHOLD_PX = 40
+# Ratios of hand.scale() (wrist-to-middle-knuckle distance), not raw pixels --
+# see pinch_drag.py for the same idea applied to the minimal demo.
+PINCH_RATIO = 0.35
+SPREAD_RATIO = 1.3
 LINK_TIMEOUT_SECONDS = 5.0
+
+# Running the face model every single frame roughly doubles per-frame
+# inference cost for no real benefit -- the mouth gesture is held for
+# ~0.4s regardless, so sampling it at a third of the frame rate still
+# gets plenty of samples per gesture while leaving more headroom for a
+# smooth, responsive hand-tracking frame rate.
+FACE_TRACK_EVERY_N_FRAMES = 3
 
 STATE_CORNER = "corner"
 STATE_FULLSCREEN = "fullscreen"
@@ -162,7 +180,13 @@ def main():
     arrow_hover_timer = HoldTimer()
     run_timer = HoldTimer()
     run_armed = True
-    smoothed_index_pt = None  # light EMA smoothing for the fullscreen cursor
+
+    index_smoother = PointSmoother()
+    pinch_smoother = PointSmoother()
+    fullscreen_cursor_smoother = PointSmoother()
+
+    blendshapes = None
+    frame_count = 0
 
     state = STATE_CORNER
     fullscreen_kind = None  # "photo" or "block"
@@ -170,7 +194,7 @@ def main():
     hwnd = None
 
     def enter_fullscreen(kind, block_id=None):
-        nonlocal state, fullscreen_kind, fullscreen_block_id, pinch_timer, arrow_hover_timer, run_timer, run_armed, smoothed_index_pt
+        nonlocal state, fullscreen_kind, fullscreen_block_id, pinch_timer, arrow_hover_timer, run_timer, run_armed
         state = STATE_FULLSCREEN
         fullscreen_kind = kind
         fullscreen_block_id = block_id
@@ -178,9 +202,9 @@ def main():
         arrow_hover_timer = HoldTimer()
         run_timer = HoldTimer()
         run_armed = True
-        smoothed_index_pt = None
+        fullscreen_cursor_smoother.update(None)
         sw, sh = screen_size()
-        move_resize(hwnd, 0, 0, sw, sh)
+        move_resize(hwnd, 0, 0, sw, sh, radius=0)
 
     def return_to_corner():
         nonlocal state, selected_index, selected_block_id, spread_timer
@@ -189,7 +213,7 @@ def main():
         selected_block_id = None
         spread_timer = HoldTimer()
         x, y = corner_position(CORNER_W, CORNER_H, corner="bottom-right")
-        move_resize(hwnd, x, y, CORNER_W, CORNER_H)
+        move_resize(hwnd, x, y, CORNER_W, CORNER_H, radius=CORNER_RADIUS)
 
     try:
         while True:
@@ -198,13 +222,19 @@ def main():
                 break
             raw_frame = cv2.flip(raw_frame, 1)
             native_h, native_w = raw_frame.shape[:2]
+            frame_count += 1
 
             hands = tracker.process(raw_frame)
             hand = hands[0] if hands else None
 
             pinch_dist = None
+            hand_scale = 0.0
+            pinch_ratio = None
             if hand is not None:
                 pinch_dist = _distance(hand.point(THUMB_TIP), hand.point(INDEX_TIP))
+                hand_scale = hand.scale()
+                if hand_scale > 0:
+                    pinch_ratio = pinch_dist / hand_scale
 
             typing_mode = state == STATE_FULLSCREEN and fullscreen_kind == "block"
 
@@ -224,7 +254,10 @@ def main():
                     selected_index = None  # gallery shrank/cleared under us
 
                 # --- mouth gesture: "O" (rounded + open jaw) held, re-armed on relaxed mouth ---
-                blendshapes = face_tracker.process(raw_frame)
+                # Throttled: the face model only actually runs every Nth frame,
+                # reusing the last result in between (see FACE_TRACK_EVERY_N_FRAMES).
+                if frame_count % FACE_TRACK_EVERY_N_FRAMES == 0:
+                    blendshapes = face_tracker.process(raw_frame)
                 mouth_face_found = blendshapes is not None
                 mouth_roundness_now = mouth_roundness(blendshapes)
                 mouth_is_o = is_mouth_o(blendshapes)
@@ -241,16 +274,21 @@ def main():
                 frame = cv2.resize(raw_frame, (CORNER_W, CORNER_H))
                 scale_x, scale_y = CORNER_W / native_w, CORNER_H / native_h
 
-                # --- scaled fingertip positions, shared by everything below ---
-                index_pt = thumb_pt = pinch_point = None
+                # --- scaled + smoothed fingertip positions, shared by everything below ---
+                raw_index_pt = raw_thumb_pt = None
                 is_pinching = False
                 if hand is not None:
                     ix, iy = hand.point(INDEX_TIP)
-                    index_pt = (int(ix * scale_x), int(iy * scale_y))
+                    raw_index_pt = (int(ix * scale_x), int(iy * scale_y))
                     tx, ty = hand.point(THUMB_TIP)
-                    thumb_pt = (int(tx * scale_x), int(ty * scale_y))
-                    pinch_point = ((index_pt[0] + thumb_pt[0]) // 2, (index_pt[1] + thumb_pt[1]) // 2)
-                    is_pinching = pinch_dist is not None and pinch_dist < PINCH_THRESHOLD_PX
+                    raw_thumb_pt = (int(tx * scale_x), int(ty * scale_y))
+                    is_pinching = pinch_ratio is not None and pinch_ratio < PINCH_RATIO
+                index_pt = index_smoother.update(raw_index_pt)
+                raw_pinch_point = (
+                    ((raw_index_pt[0] + raw_thumb_pt[0]) // 2, (raw_index_pt[1] + raw_thumb_pt[1]) // 2)
+                    if raw_index_pt is not None else None
+                )
+                pinch_point = pinch_smoother.update(raw_pinch_point)
 
                 # --- hover gesture: index fingertip over a thumbnail selects it ---
                 rects = thumbnail_rects(len(gallery), CORNER_W)
@@ -271,8 +309,8 @@ def main():
                 for i, (item, rect) in enumerate(zip(gallery, rects)):
                     x1, y1, x2, y2 = rect
                     frame[y1:y2, x1:x2] = item["thumb"]
-                    color = (0, 255, 255) if i == selected_index else (255, 255, 255)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    color = theme.ACCENT if i == selected_index else theme.BORDER
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
 
                 # --- "+"/"<>" buttons: hover to create a block, must leave before another fires ---
                 hovering_text_button = index_pt is not None and point_in_rect(index_pt, BUTTON_TEXT_RECT)
@@ -326,18 +364,14 @@ def main():
                 block_manager.draw(frame, hovering_text_button, hovering_code_button,
                                     selected_block_id, linking_from, trash_progress)
 
-                if linking_from is not None:
-                    cv2.putText(frame, "Mode liaison : pointez un 2e bloc", (36, CORNER_H - 38),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
-
-                # --- spread-to-fullscreen, for whichever kind is selected ---
+                # --- selected photo preview + spread-to-fullscreen ---
                 if selected_index is not None:
                     big = cv2.resize(gallery[selected_index]["full"], (CORNER_W - 20, CORNER_H - 20))
                     frame[10:10 + big.shape[0], 10:10 + big.shape[1]] = big
-                    cv2.rectangle(frame, (10, 10), (10 + big.shape[1], 10 + big.shape[0]), (0, 255, 255), 2)
+                    cv2.rectangle(frame, (10, 10), (10 + big.shape[1], 10 + big.shape[0]), theme.ACCENT, 2, cv2.LINE_AA)
 
                 if selected_index is not None or selected_block_id is not None:
-                    is_spread = pinch_dist is not None and pinch_dist > SPREAD_THRESHOLD_PX
+                    is_spread = pinch_ratio is not None and pinch_ratio > SPREAD_RATIO
                     if spread_timer.update(is_spread) >= SPREAD_HOLD_SECONDS and hwnd is not None:
                         if selected_block_id is not None:
                             enter_fullscreen("block", selected_block_id)
@@ -346,19 +380,27 @@ def main():
                 else:
                     spread_timer.update(False)
 
+                # --- bottom status dock: fist progress, mouth diagnostic, link hint ---
+                theme.draw_glass_panel(frame, (0, CORNER_H - 50), (CORNER_W, CORNER_H), radius=0)
+
                 if fist_armed and fist_held > 0:
                     pct = min(fist_held / FIST_HOLD_SECONDS, 1.0)
-                    cv2.rectangle(frame, (10, CORNER_H - 20), (10 + int(100 * pct), CORNER_H - 12), (0, 255, 0), -1)
+                    cv2.rectangle(frame, (10, CORNER_H - 20), (110, CORNER_H - 12), theme.BORDER, -1, cv2.LINE_AA)
+                    cv2.rectangle(frame, (10, CORNER_H - 20), (10 + int(100 * pct), CORNER_H - 12), theme.SUCCESS, -1, cv2.LINE_AA)
+
+                if linking_from is not None:
+                    theme.put_text(frame, "Mode liaison : pointez un 2e bloc", (36, CORNER_H - 30),
+                                    scale=0.48, color=theme.ACCENT, thickness=2)
 
                 # --- mouth diagnostic: face-found status + live "O" score, bottom-right ---
                 mouth_label = f"bouche: {mouth_roundness_now:.2f}" if mouth_face_found else "bouche: visage non detecte"
-                cv2.putText(frame, mouth_label, (CORNER_W - 210, CORNER_H - 26),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                            (0, 255, 0) if mouth_face_found else (0, 0, 255), 1)
+                theme.put_text(frame, mouth_label, (CORNER_W - 210, CORNER_H - 26),
+                                scale=0.4, color=theme.SUCCESS if mouth_face_found else theme.DANGER)
                 mouth_pct = 1.0 if not mouth_armed else min(mouth_held / MOUTH_O_HOLD_SECONDS, 1.0)
-                mouth_bar_color = (0, 255, 0) if mouth_is_o else (100, 100, 100)
+                mouth_bar_color = theme.SUCCESS if mouth_is_o else theme.BORDER
+                cv2.rectangle(frame, (CORNER_W - 110, CORNER_H - 20), (CORNER_W - 10, CORNER_H - 12), theme.BORDER, -1, cv2.LINE_AA)
                 cv2.rectangle(frame, (CORNER_W - 110, CORNER_H - 20), (CORNER_W - 110 + int(100 * mouth_pct), CORNER_H - 12),
-                              mouth_bar_color, -1)
+                              mouth_bar_color, -1, cv2.LINE_AA)
 
             elif fullscreen_kind == "photo":
                 screen_w, screen_h = screen_size()
@@ -367,12 +409,12 @@ def main():
                 preview_w, preview_h = 220, 160
                 preview = cv2.resize(raw_frame, (preview_w, preview_h))
                 px, py = 20, screen_h - preview_h - 20
+                theme.draw_glass_panel(frame, (px - 10, py - 40), (px + preview_w + 10, py + preview_h + 10), radius=14)
                 frame[py:py + preview_h, px:px + preview_w] = preview
-                cv2.rectangle(frame, (px, py), (px + preview_w, py + preview_h), (0, 255, 255), 2)
-                cv2.putText(frame, "pincez pour revenir", (px, py - 12),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.rectangle(frame, (px, py), (px + preview_w, py + preview_h), theme.ACCENT, 2, cv2.LINE_AA)
+                theme.put_text(frame, "pincez pour revenir", (px, py - 14), scale=0.55, color=theme.TEXT_PRIMARY, thickness=2)
 
-                is_pinching = pinch_dist is not None and pinch_dist < PINCH_THRESHOLD_PX
+                is_pinching = pinch_ratio is not None and pinch_ratio < PINCH_RATIO
                 if pinch_timer.update(is_pinching) >= PINCH_HOLD_SECONDS and hwnd is not None:
                     return_to_corner()
 
@@ -389,18 +431,9 @@ def main():
                     if hand is not None:
                         ix, iy = hand.point(INDEX_TIP)
                         raw_pt = map_to_screen(ix, iy, native_w, native_h, screen_w, screen_h)
-                        if smoothed_index_pt is None:
-                            smoothed_index_pt = raw_pt
-                        else:
-                            alpha = 0.35
-                            smoothed_index_pt = (
-                                int(smoothed_index_pt[0] * (1 - alpha) + raw_pt[0] * alpha),
-                                int(smoothed_index_pt[1] * (1 - alpha) + raw_pt[1] * alpha),
-                            )
-                        index_pt_full = smoothed_index_pt
+                        index_pt_full = fullscreen_cursor_smoother.update(raw_pt)
                     else:
-                        smoothed_index_pt = None
-                        index_pt_full = None
+                        index_pt_full = fullscreen_cursor_smoother.update(None)
 
                     # --- code blocks: closed fist, held, runs the typed code ---
                     is_fist = hand is not None and hand.is_fist()
@@ -423,8 +456,8 @@ def main():
                             arrow_rect = block_manager.draw_fullscreen(frame, block, hovering_arrow=True, run_progress=run_progress)
 
                     if index_pt_full is not None:
-                        cv2.circle(frame, index_pt_full, 10, (0, 255, 255), -1)
-                        cv2.circle(frame, index_pt_full, 10, (255, 255, 255), 2)
+                        cv2.circle(frame, index_pt_full, 10, theme.ACCENT, -1, cv2.LINE_AA)
+                        cv2.circle(frame, index_pt_full, 10, theme.TEXT_PRIMARY, 2, cv2.LINE_AA)
 
                     if arrow_hover and arrow_hover_timer.update(True) >= HOVER_HOLD_SECONDS:
                         fullscreen_block_id = block["linked_to"]
@@ -438,25 +471,25 @@ def main():
                     preview_w, preview_h = 220, 160
                     preview = cv2.resize(raw_frame, (preview_w, preview_h))
                     px, py = 20, screen_h - preview_h - 20
-                    frame[py:py + preview_h, px:px + preview_w] = preview
-                    cv2.rectangle(frame, (px, py), (px + preview_w, py + preview_h), (0, 255, 255), 2)
                     hint = ("tapez du code -- poing ferme pour executer -- Echap ou pincez pour revenir"
                             if block["kind"] == "code" else
                             "tapez du texte -- Echap ou pincez pour revenir")
-                    cv2.putText(frame, hint, (px, py - 12),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                    theme.draw_glass_panel(frame, (px - 10, py - 40), (px + preview_w + 10, py + preview_h + 10), radius=14)
+                    frame[py:py + preview_h, px:px + preview_w] = preview
+                    cv2.rectangle(frame, (px, py), (px + preview_w, py + preview_h), theme.ACCENT, 2, cv2.LINE_AA)
+                    theme.put_text(frame, hint, (px, py - 14), scale=0.48, color=theme.TEXT_PRIMARY, thickness=2)
 
                     # A closed fist naturally brings thumb+index close together too,
                     # so without `not is_fist` here, running code (fist) would also
                     # register as the pinch-to-return gesture and immediately exit.
-                    is_pinching = pinch_dist is not None and pinch_dist < PINCH_THRESHOLD_PX and not is_fist
+                    is_pinching = pinch_ratio is not None and pinch_ratio < PINCH_RATIO and not is_fist
                     if pinch_timer.update(is_pinching) >= PINCH_HOLD_SECONDS and hwnd is not None:
                         return_to_corner()
 
             cv2.imshow(WINDOW_TITLE, frame)
 
             if hwnd is None:
-                hwnd = pin_to_corner(WINDOW_TITLE, CORNER_W, CORNER_H, corner="bottom-right")
+                hwnd = pin_to_corner(WINDOW_TITLE, CORNER_W, CORNER_H, corner="bottom-right", radius=CORNER_RADIUS)
 
             key = cv2.waitKey(1) & 0xFF
             if typing_mode:

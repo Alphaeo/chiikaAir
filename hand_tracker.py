@@ -22,6 +22,7 @@ WRIST = 0
 THUMB_TIP = 4
 INDEX_PIP = 6
 INDEX_TIP = 8
+MIDDLE_MCP = 9
 MIDDLE_PIP = 10
 MIDDLE_TIP = 12
 RING_PIP = 14
@@ -69,6 +70,16 @@ class Hand:
             if _distance(self.point(tip_idx), wrist) < _distance(self.point(pip_idx), wrist)
         )
         return curled >= min_curled
+
+    def scale(self) -> float:
+        """A stable reference distance (wrist to middle-finger knuckle)
+        that grows and shrinks with how close the hand is to the
+        camera. Dividing a raw pixel distance (like thumb-to-index) by
+        this turns it into a scale-invariant ratio, so pinch/spread
+        gesture thresholds behave the same whether the hand is close
+        to or far from the webcam, instead of only working at one
+        specific distance."""
+        return _distance(self.point(WRIST), self.point(MIDDLE_MCP))
 
 
 class HandTracker:
