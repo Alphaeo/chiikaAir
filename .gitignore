@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+# MediaPipe model files are downloaded, not committed -- see README for the
+# exact URLs used to fetch them into models/.
+models/*.task
